@@ -1,0 +1,8 @@
+# Heimann 双光红外上位机依赖
+# Python >= 3.10 推荐
+
+pyserial>=3.5          # 串口通信
+numpy>=1.24            # 帧数据处理
+matplotlib>=3.7        # 热成像与温度曲线绘制
+pillow>=10.0           # 可见光帧 RGB565 → RGB888 转换与显示
+opencv-python>=4.8     # 双边滤波 (可选, 不装也能跑, 仅热像滤波功能不可用)
