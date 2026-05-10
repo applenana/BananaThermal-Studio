@@ -1,116 +1,140 @@
-# Heimann 双光红外测温仪 — 全能上位机
+# 🍌 BananaThermal Studio
 
-> 适配 RP2040 + Heimann HTPA32x32d 热成像 + OV2640/OV3660 可见光双光融合的开源测温仪
+> A modular PC host (上位机) for **BananaNi Thermal Imager** — the open-source RP2040 + Heimann HTPA dual-light (thermal + visible) imaging device.
 >
-> 基于设备固件 `streaming.h` 模块实现的串口推流协议, 同时接收**热成像帧**与**可见光帧**, 实时显示并支持设备激活、命令调试。
+> 适配 **香蕉泥热成像通讯协议** 的开源 PC 端上位机, 支持热成像帧 + 可见光帧实时双光显示、温度曲线、设备激活与串口调试.
+
+<p align="center">
+  <img alt="python" src="https://img.shields.io/badge/python-3.10%2B-blue">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+  <img alt="status" src="https://img.shields.io/badge/status-active-brightgreen">
+</p>
 
 ---
 
-## 功能概览
+## ✨ Features
 
-- **双光实时投屏**
-  - 热成像 32×24 浮点温度帧 (固件 `stream` 命令)
-  - 可见光 120×160 RGB565 帧 (固件 `vstream` 命令)
-  - 两路心跳独立, 用户可单开/双开/全关
-- **设备管理**: 自动搜索串口, 读取设备 SN/版本/激活状态
-- **激活流程**: 校验激活码, 持久化激活时间与保修期
-- **命令调试**: 收发任意串口命令, 实时显示设备返回
-- **温度曲线**: 实时绘制 max/min/avg 温度历史折线图
+- 🔥 **Dual-Light Live Streaming** — Thermal (32×24 float) + Visible (RGB565 120×160 / 120×120) side-by-side, parsed from a single serial byte stream
+- 🧠 **Stateful Frame Parser** — Zero-GUI [`frame_parser.py`](frame_parser.py) splits the multiplexed stream by `BEGIN/END` and `VBEG/VEND` magic markers, fully unit-testable
+- 🎛️ **Hot-Plug Auto-Detect** — Scans serial ports, queries `GetSysInfo`, distinguishes activated vs. unactivated devices
+- 🔐 **Activation Workflow** — Compatible with the legacy 激活上位机 protocol (`activate <key>`)
+- 🌡️ **Filtering** — 1-D Kalman on T_max / T_min / T_avg, 2-D per-pixel Kalman on the 24×32 frame, optional bilateral filter (OpenCV)
+- 📈 **Real-time Chart** — Rolling 100-point min/max/avg curves via Matplotlib
+- 🔄 **Visible-Light Controls** — Per-display rotation (0/90/180/270, default 90°), horizontal/vertical mirror, FPS readout
+- 🖥️ **High-DPI Aware** — `PROCESS_PER_MONITOR_DPI_AWARE` on Windows + adjustable global font scaling
+- 💬 **Built-in Console** — Send raw commands (`stream`, `vstream`, `GetSysInfo`, `activate <key>`, …) directly from the GUI
 
----
+## 📡 Protocol — BananaNi Thermal Wire Format
 
-## 目录结构
+Both streams are multiplexed on a single 1 Mbps serial link. The parser is a strict state machine.
+
+### Thermal frame (3092 bytes)
 
 ```
-全能上位机/
-├── README.md                   # 本文件
-├── requirements.txt            # Python 依赖
-├── .gitignore
-├── .venv/                      # 虚拟环境 (本地, git 忽略)
-├── frame_parser.py             # 串口帧解析模块 (BEGIN/END + VBEG/VEND)
-├── visible_view.py             # 可见光显示组件 (Tkinter Canvas + PIL)
-├── thermal_dual_app.py         # 主程序 (Tkinter GUI 入口)
-└── font/                       # (可选) HarmonyOS 字体, 改善中文显示
+BEGIN | T_max(4) | T_min(4) | T_avg(4) | float[768] (3072) | END
 ```
 
----
+- All floats are little-endian IEEE 754
+- 768 = 24 × 32 pixels
+- Triggered by `stream\n`, kept alive by 500 ms re-sends, device stops on 1 s silence (returns `streaming stoped`)
 
-## 协议规范
+### Visible frame (variable)
 
-> 与设备固件 `src/streaming.h` 字节级一致。所有多字节字段为**小端**。
-
-### A. 热成像帧 (向后兼容旧固件)
-
-| 段 | 大小 | 内容 |
-|---|---|---|
-| Magic | 5 B | ASCII `"BEGIN"` |
-| T_max | 4 B | float32, 单位 °C |
-| T_min | 4 B | float32, 单位 °C |
-| T_avg | 4 B | float32, 单位 °C |
-| Pixels | 3072 B | float32 × 768 (24 行 × 32 列, 行优先) |
-| Magic | 3 B | ASCII `"END"` |
-
-### B. 可见光帧 (固件 v2 新增)
-
-| 段 | 大小 | 内容 |
-|---|---|---|
-| Magic | 4 B | ASCII `"VBEG"` |
-| width | 4 B | uint32, 通常 120 |
-| height | 4 B | uint32, 全屏模式 160 / 方屏模式 120 |
-| len | 4 B | uint32, payload 字节数 = width × height × 2 |
-| payload | len B | RGB565 像素, 行优先, 每像素小端 uint16 |
-| Magic | 4 B | ASCII `"VEND"` |
-
-### C. 控制命令 (上位机 → 设备)
-
-| 命令 | 作用 | 保活 |
-|---|---|---|
-| `stream\n` | 启动热成像推流 | 1000ms 内必须重发 |
-| `vstream\n` | 启动可见光推流 | 1000ms 内必须重发 |
-| 其他命令 | 见固件 `help` 命令 | — |
-
-> ⚠️ 设备只在收到对应保活命令的 1s 时间窗内推流, 上位机需开独立心跳线程。
-
----
-
-## 快速开始
-
-### 1. 创建虚拟环境
-
-```powershell
-cd D:\Github_project\全能上位机
-py -3 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```
+VBEG | width(4) | height(4) | length(4) | RGB565[length] | VEND
 ```
 
-### 2. 安装依赖
+- Width fixed = 120, height = 160 (full-screen mode) or 120 (square mode)
+- All u32 are little-endian
+- Triggered by `vstream\n`, same 500 ms keepalive, 1 s timeout (`vstream stoped`)
 
-```powershell
+> See [3inch2-Heimann-dual-thermal/src/streaming.h](https://github.com/) for the firmware-side reference implementation.
+
+## 🚀 Quick Start
+
+### 1. Install
+
+```bash
+git clone https://github.com/<you>/banana-thermal-studio.git
+cd banana-thermal-studio
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# Linux / macOS
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. 运行
+### 2. Run
 
-```powershell
+```bash
 python thermal_dual_app.py
 ```
 
-启动后界面会自动搜索 USB 串口。设备插入后约 2 秒内自动连接并显示 SN/激活状态。
+The app auto-scans serial ports and pops up the activation panel on first connect.
+
+### 3. Adjust UI scale (optional)
+
+```bash
+# Windows PowerShell
+$env:THERMAL_DUAL_FONT_SIZE = "14"     # default 12
+$env:THERMAL_DUAL_SCALE     = "1.8"    # tk scaling, default 2.0
+python thermal_dual_app.py
+```
+
+## 🗂️ Project Layout
+
+```
+banana-thermal-studio/
+├─ thermal_dual_app.py     # Main GUI (Tkinter + Matplotlib)
+├─ visible_view.py         # Reusable visible-light display widget
+├─ frame_parser.py         # Pure-Python protocol parser (zero GUI deps)
+├─ requirements.txt        # numpy / matplotlib / pillow / opencv-python / pyserial
+└─ font/                   # Bundled HarmonyOS Sans SC for matplotlib zh rendering
+```
+
+## 🧪 Self-Test
+
+The parser ships with a built-in round-trip test:
+
+```bash
+python frame_parser.py
+# -> [self-test] thermal frames decoded: 1
+#    [self-test] visible frames decoded: 1
+#    [self-test] PASSED
+```
+
+## 🛠️ Tech Stack
+
+| Layer | Choice |
+|---|---|
+| GUI | `tkinter` + `ttk` |
+| Plotting | `matplotlib` (TkAgg backend) |
+| Image | `Pillow`, optional `opencv-python` for bilateral filter |
+| Serial | `pyserial` 3.5+ |
+| Threading | 1 reader thread + 1 monitor thread + 2 keepalive threads + main-thread queue dispatch |
+
+## 🤝 Contributing
+
+Issues and PRs are welcome. Please follow the existing module split:
+
+- New protocol fields → extend `FrameParser` and add a self-test case
+- New display modes → subclass / extend `VisibleView`, do **not** poke at `thermal_dual_app.py`'s threads directly
+- GUI tweaks → keep the layout responsive to `_win_ratio` font scaling
+
+## 📜 License
+
+MIT © 2025 BananaNi
+
+## 🙏 Acknowledgements
+
+- Heimann Sensor — HTPA32x32d datasheet
+- OmniVision — OV2640 / OV3660 reference
+- Earthquake Bone Cooker / 香蕉泥 — original 激活上位机 protocol baseline
 
 ---
 
-## 二次开发提示
-
-- `frame_parser.py` **零 GUI 依赖**, 可直接复用到任何后端项目 (服务器、SDK、自动化测试)。
-- `visible_view.py` 单独的 Tkinter 组件, 可拆出嵌入其他 GUI。
-- 主程序 `thermal_dual_app.py` 中的滤波/绘图函数都是独立方法, 关注点清晰。
-- 想增加帧类型? 只需在 `frame_parser.FrameParser` 状态机里加一个 magic 分支, 主程序注册对应回调即可。
-
----
-
-## 兼容性
-
-- 设备固件: **必须 ≥ v2** (引入 `streaming.h` 模块的版本) 才支持 `vstream`
-- 旧固件: 仅热成像功能可用, 可见光开关无效但不报错
-- Python: 3.10+ (使用了 `match` 语句 / typing 改进)
-- 操作系统: Windows / Linux / macOS (USB CDC 跨平台一致)
+<p align="center">
+  Made with 🍌 for fellow tinkerers.
+</p>
