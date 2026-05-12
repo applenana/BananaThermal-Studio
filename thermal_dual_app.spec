@@ -23,6 +23,10 @@ for sub in ('font', 'fonts'):
 
 hiddenimports = []
 hiddenimports += collect_submodules('matplotlib.backends')
+# numpy 2.x 子模块需要显式收集, 否则报 'numpy._core._exceptions' 缺失
+hiddenimports += collect_submodules('numpy')
+# PIL 的可选后端
+hiddenimports += collect_submodules('PIL')
 
 a = Analysis(
     ['thermal_dual_app.py'],
