@@ -5,4 +5,5 @@ pyserial>=3.5          # 串口通信
 numpy>=1.24            # 帧数据处理
 matplotlib>=3.7        # 热成像与温度曲线绘制
 pillow>=10.0           # 可见光帧 RGB565 → RGB888 转换与显示
-opencv-python>=4.8     # 双边滤波 (可选, 不装也能跑, 仅热像滤波功能不可用)
+opencv-python>=4.8     # 双边滤波 + 图片下载 tab 的可见光融合 (Sobel/Canny 边缘)
+scipy>=1.10            # 图片下载 tab 的双线性/scipy.ndimage 上采样 (可选, 缺失则降级)

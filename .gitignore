@@ -2,7 +2,9 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+# PyInstaller spec: 默认忽略, 但仓库自带的入库
 *.spec
+!thermal_dual_app.spec
 
 # 虚拟环境
 .venv/
@@ -24,3 +26,8 @@ Thumbs.db
 # 打包产物
 build/
 dist/
+
+# 程序运行产物
+photo_download_*/
+_triple.txt
+_snap*.py

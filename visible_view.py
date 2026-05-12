@@ -130,6 +130,26 @@ class VisibleView(ttk.Frame):
         self.image_label.configure(image="")
         self.fps_label.configure(text="FPS: --")
 
+    def get_latest_image_pil(self) -> "Image.Image | None":
+        """返回应用了旋转/镜像之后的最新 PIL.Image (RGB), 供外部融合使用. 无帧返回 None."""
+        if self._latest_frame is None:
+            return None
+        arr = self._latest_frame
+        if self.mirror_h_var.get():
+            arr = arr[:, ::-1, :]
+        if self.mirror_v_var.get():
+            arr = arr[::-1, :, :]
+        img = Image.fromarray(arr, mode="RGB")
+        rot = self.rotation_var.get()
+        if rot:
+            mapping = {
+                90: Image.Transpose.ROTATE_270,
+                180: Image.Transpose.ROTATE_180,
+                270: Image.Transpose.ROTATE_90,
+            }
+            img = img.transpose(mapping[rot])
+        return img
+
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------

@@ -53,14 +53,47 @@ except ImportError:  # pragma: no cover
 
 from frame_parser import FrameParser
 from visible_view import VisibleView
+import fusion_utils
+from PIL import Image, ImageTk
 
 
 # ============================================================================
-# 字体加载 (matplotlib 中文支持). 同目录下 font/HarmonyOS_Sans_SC_Regular.ttf 可选
+# 字体加载 (matplotlib 中文支持). 兼容 PyInstaller 单文件 exe.
 # ============================================================================
-_FONT_PATH = os.path.join(os.path.dirname(__file__), "font", "HarmonyOS_Sans_SC_Regular.ttf")
-if os.path.exists(_FONT_PATH):
+def _resource_base() -> str:
+    """PyInstaller --onefile 时返回 sys._MEIPASS, 普通运行返回脚本目录."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return sys._MEIPASS  # type: ignore[attr-defined]
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _find_bundled_font() -> str | None:
+    """按优先级搜索 ttf/otf 字体. 用于 matplotlib 中文渲染."""
+    base = _resource_base()
+    # 候选目录: 资源根 / font 子目录 / 同级 fonts 目录
+    candidates: list[str] = []
+    for sub in ("", "font", "fonts"):
+        d = os.path.join(base, sub) if sub else base
+        if os.path.isdir(d):
+            try:
+                for fn in os.listdir(d):
+                    low = fn.lower()
+                    if low.endswith((".ttf", ".otf", ".ttc")):
+                        candidates.append(os.path.join(d, fn))
+            except OSError:
+                pass
+    # 优先 HarmonyOS / Smiley / 任意
+    for prefer in ("harmonyos", "smileysans", "notosans", "msyh"):
+        for c in candidates:
+            if prefer in os.path.basename(c).lower():
+                return c
+    return candidates[0] if candidates else None
+
+
+_FONT_PATH = _find_bundled_font()
+if _FONT_PATH:
     _font_prop = fm.FontProperties(fname=_FONT_PATH)
+    fm.fontManager.addfont(_FONT_PATH)
     plt.rcParams["font.sans-serif"] = [_font_prop.get_name(), "SimHei", "Microsoft YaHei", "DejaVu Sans"]
 else:
     _font_prop = None
@@ -133,23 +166,15 @@ class ThermalDualApp:
     VISIBLE_HB_INTERVAL = 0.5     # `vstream` 心跳, 设备端 1s 超时, 必须 <1s
     MAX_HISTORY_POINTS = 100      # 温度曲线最大保留点数
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, win_ratio: float = 1.0):
         self.root = root
         self.root.title("热成像 + 可见光 双光上位机")
 
-        # ---- 全局字体加大: 默认 12 号 (Tk 原默认9 号过小) ----
-        self._setup_fonts()
-
-        # 窗口尺寸随字号缩放: ratio = size / 9 (Tk 默认字号9)
-        try:
-            from tkinter import font as tkfont
-            _ratio = tkfont.nametofont("TkDefaultFont").cget("size") / 9.0
-        except Exception:
-            _ratio = 1.0
-        self._win_ratio = _ratio
-        w = int(640 * _ratio); h = int(360 * _ratio)
-        self.root.geometry(f"{w}x{h}")
-        self.root.minsize(w, h)
+        # 字体 / 缩放: 由 main() 统一处理 DPI awareness + tk scaling.
+        # win_ratio 用于把 geometry/minsize 像素值同步放大, 避免内容装不下.
+        self._win_ratio = win_ratio
+        self.root.geometry(self._scaled_geom(520, 110))
+        self.root.minsize(*self._scaled(420, 90))
         self._after_id_queue: str | None = None  # 保存 after 句柄以便退出时取消
 
         # ---- 串口与设备 ----
@@ -170,6 +195,7 @@ class ThermalDualApp:
         self.stop_event = threading.Event()       # 程序退出时置位
         self.thermal_hb_running = False
         self.visible_hb_running = False
+        self.reader_paused = False  # 图片下载 tab 激活时设为 True, 暂停 frame parser 喂数据
 
         # ---- 帧解析 ----
         self.parser = FrameParser(
@@ -186,6 +212,28 @@ class ThermalDualApp:
         self.history_max: list[float] = []
         self.history_min: list[float] = []
         self.history_avg: list[float] = []
+
+        # ---- 融合状态 (PC 端实时融合, 与 photo_download_tab 同款算法) ----
+        self.fusion_mode_var = tk.StringVar(value="blend")  # off / blend / edge
+        self.fusion_alpha = tk.DoubleVar(value=0.5)
+        self.fusion_gamma = tk.DoubleVar(value=1.0)
+        self.fusion_edge_strength = tk.DoubleVar(value=0.6)
+        self.fusion_edge_thresh = tk.DoubleVar(value=0.082)
+        self.fusion_edge_width = tk.IntVar(value=1)
+        self.edge_color = "#333333"
+        # ---- 伪彩 (与 photo_download_tab 同款) ----
+        self.colormap_name = tk.StringVar(value="jet")
+        self.mapping_curve = tk.StringVar(value="linear")  # linear / nonlinear
+        self.use_custom_colors = tk.BooleanVar(value=False)
+        self.cold_color = "#0000ff"
+        self.mid_color = "#00ff00"
+        self.hot_color = "#ff0000"
+        self._latest_visible_pil: Image.Image | None = None  # 最近一帧可见光 (RGB), 主线程访问
+        self._latest_thermal_arr: np.ndarray | None = None   # 最近一帧热像滤波后矩阵
+        self._latest_clim: tuple[float, float] | None = None # 当前 vmin/vmax
+        self._fusion_photo: ImageTk.PhotoImage | None = None  # 防 GC
+        self._fusion_redraw_pending = False
+        self._saved_fusion_mode: str | None = None  # tab 切换时暂存, 切回恢复
 
         # ---- 主线程消息队列 (后台 → UI) ----
         self.msg_queue: queue.Queue = queue.Queue()
@@ -205,218 +253,422 @@ class ThermalDualApp:
     # UI 构建
     # =================================================================
 
-    def _setup_fonts(self):
-        """通过环境变量 THERMAL_DUAL_FONT_SIZE 控制全局字号 (默认 14).
+    def _scaled(self, *vals):
+        r = self._win_ratio
+        return tuple(int(v * r) for v in vals)
 
-        说明: tk scaling 在 Win DPI-aware 下对 TkDefaultFont 影响有限,
-        直接调 size 才是稳定可见的放大方式.
+    def _scaled_geom(self, w, h):
+        sw, sh = self._scaled(w, h)
+        return f"{sw}x{sh}"
+
+    def _setup_fonts(self):
+        """统一基础字体大小, 与旧上位机视觉一致 (DPI-unaware, 9pt 系列).
+
+        旧上位机/图片下载工具在 96 DPI 下渲染，控件字 9~10pt 视觉刚好.
+        我们若不主动设, Tk 默认 MS Shell Dlg 2 size 8 偏小, 控件显得拥挤.
         """
         from tkinter import font as tkfont
-        try:
-            size = int(os.environ.get("THERMAL_DUAL_FONT_SIZE", "12"))
-        except ValueError:
-            size = 12
-        for name in (
-            "TkDefaultFont", "TkTextFont", "TkHeadingFont", "TkMenuFont",
-            "TkTooltipFont", "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont",
-        ):
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                     "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                     "TkIconFont", "TkTooltipFont"):
             try:
-                f = tkfont.nametofont(name)
-                f.configure(family="Microsoft YaHei UI", size=size)
-            except tk.TclError:
+                tkfont.nametofont(name).configure(family="Microsoft YaHei UI", size=10)
+            except Exception:
                 pass
-        try:
-            tkfont.nametofont("TkFixedFont").configure(family="Consolas", size=size - 1)
-        except tk.TclError:
-            pass
-        style = ttk.Style()
-        style.configure(".", font=("Microsoft YaHei UI", size))
-        style.configure("TLabelframe.Label", font=("Microsoft YaHei UI", size, "bold"))
-        style.configure("TButton", padding=(int(size * 0.7), int(size * 0.35)))
 
     def _build_ui(self):
-        """构建顶部控制栏 + 主内容区域. 主内容默认隐藏, 激活后显示."""
-        # ---------- 顶部控制栏 ----------
-        ctrl = ttk.Frame(self.root, padding=10)
-        ctrl.grid(row=0, column=0, sticky="we")
+        """UI 总入口: 单行顶栏 + Notebook 主内容. 激活前 Notebook 隐藏."""
+        self._setup_fonts()
+        # ============= 顶栏 (单行: 端口 / 状态 / 设备信息) =============
+        top = ttk.Frame(self.root, padding=(10, 6))
+        top.grid(row=0, column=0, sticky="we")
 
-        # 串口选择
-        port_box = ttk.LabelFrame(ctrl, text="设备连接", padding=8)
-        port_box.grid(row=0, column=0, sticky="we", pady=(0, 8))
-
-        ttk.Label(port_box, text="串口:").grid(row=0, column=0, padx=(0, 4))
+        # --- 串口选择 ---
+        ttk.Label(top, text="串口:").pack(side=tk.LEFT)
         self.port_var = tk.StringVar(value="自动搜索")
-        self.port_combo = ttk.Combobox(port_box, textvariable=self.port_var,
-                                       state="readonly", width=28)
-        self.port_combo.grid(row=0, column=1, sticky="we", padx=(0, 8))
+        self.port_combo = ttk.Combobox(top, textvariable=self.port_var,
+                                       state="readonly", width=24)
+        self.port_combo.pack(side=tk.LEFT, padx=(4, 4))
         self.port_combo.bind("<<ComboboxSelected>>", self._on_port_selected)
-        ttk.Button(port_box, text="刷新", width=6,
-                   command=self._refresh_ports).grid(row=0, column=2)
+        ttk.Button(top, text="刷新", width=6,
+                   command=self._refresh_ports).pack(side=tk.LEFT)
 
-        # 投屏 / 滤波选项 (激活后才显示)
-        self.options_frame = ttk.Frame(port_box)
-        self.options_frame.grid(row=1, column=0, columnspan=3, sticky="we", pady=(8, 0))
-        self.options_frame.grid_remove()
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
-        self.var_filter = tk.BooleanVar(value=True)
-        self.var_bilateral = tk.BooleanVar(value=HAS_CV2)
-        self.var_thermal_on = tk.BooleanVar(value=True)
-        self.var_visible_on = tk.BooleanVar(value=True)   # 默认开启可见光投屏
+        # --- 状态 ---
+        self.status_label = ttk.Label(top, text="正在搜索设备...", foreground="orange")
+        self.status_label.pack(side=tk.LEFT)
 
-        ttk.Checkbutton(self.options_frame, text="卡尔曼滤波",
-                        variable=self.var_filter).grid(row=0, column=0, padx=(0, 12))
-        ttk.Checkbutton(self.options_frame, text="双边滤波",
-                        variable=self.var_bilateral,
-                        state=("normal" if HAS_CV2 else "disabled")).grid(row=0, column=1, padx=(0, 12))
-        ttk.Checkbutton(self.options_frame, text="热成像投屏",
-                        variable=self.var_thermal_on,
-                        command=self._toggle_thermal).grid(row=0, column=2, padx=(0, 12))
-        ttk.Checkbutton(self.options_frame, text="可见光投屏",
-                        variable=self.var_visible_on,
-                        command=self._toggle_visible).grid(row=0, column=3)
-
-        port_box.columnconfigure(1, weight=1)
-
-        # 状态条
-        self.status_label = ttk.Label(ctrl, text="状态: 正在搜索设备...",
-                                      foreground="orange")
-        self.status_label.grid(row=1, column=0, sticky="we")
-
-        # 设备信息 (激活后显示)
-        self.dev_info_frame = ttk.Frame(ctrl)
-        self.dev_info_frame.grid(row=2, column=0, sticky="we", pady=(4, 0))
-        self.dev_info_frame.grid_remove()
+        # --- 右侧设备信息条 (激活后显示) ---
+        self.dev_info_frame = ttk.Frame(top)
         self._build_device_info(self.dev_info_frame)
+        # 默认不 pack, 等 _handle_device_info 调用
 
-        # 激活面板 (未激活才显示)
+        # ============= Notebook (实时投屏 / 图片下载) =============
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=(2, 8))
+        self.notebook.grid_remove()  # 激活前隐藏
+
+        self.main_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.main_frame, text="实时投屏")
+        self._build_realtime_tab(self.main_frame)
+
+        self.photo_tab_frame = ttk.Frame(self.notebook)
+        self.notebook.add(self.photo_tab_frame, text="图片下载")
+        self.photo_tab: object | None = None
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+        # 激活面板占位
         self.activation_frame: ttk.LabelFrame | None = None
         self.activation_key_var: tk.StringVar | None = None
-
-        ctrl.columnconfigure(0, weight=1)
-
-        # ---------- 主内容: 左 (热) + 右 (可见光) ----------
-        self.main_frame = ttk.Frame(self.root, padding=8)
-        self.main_frame.grid(row=1, column=0, sticky="nsew")
-        self.main_frame.grid_remove()
-
-        left = ttk.Frame(self.main_frame)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
-        right = ttk.Frame(self.main_frame)
-        right.grid(row=0, column=1, sticky="nsew")
-
-        self._build_temperature_panel(left)
-        self._build_thermal_canvas(left)
-        self._build_chart_canvas(left)
-        self._build_visible_panel(right)
-        self._build_debug_panel(right)
-
-        self.main_frame.columnconfigure(0, weight=1)
-        self.main_frame.columnconfigure(1, weight=1)
-        self.main_frame.rowconfigure(0, weight=1)
-        left.rowconfigure(2, weight=1)
-        right.rowconfigure(0, weight=2)
-        right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
 
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-    # ----------- 设备信息条 -----------
-    def _build_device_info(self, parent):
-        ttk.Label(parent, text="序列号:").grid(row=0, column=0, padx=(0, 4))
-        self.lbl_serial = ttk.Label(parent, text="--", foreground="gray")
-        self.lbl_serial.grid(row=0, column=1, padx=(0, 12))
+    def _build_realtime_tab(self, parent):
+        """实时投屏 tab 布局:
+            row 0: [融合主画面 | 控制面板(温度/曲线/显示/伪彩/融合)]
+            row 1: 串口调试 (固定低高度)
+        主画面高度跟随右侧控制面板内容自然高度 (row 0 不设 weight, 由控件自身决定).
+        """
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)   # 主区: 占满
+        parent.rowconfigure(1, weight=0)   # 调试: 固定
 
-        ttk.Label(parent, text="版本:").grid(row=0, column=2, padx=(0, 4))
-        self.lbl_version = ttk.Label(parent, text="--", foreground="gray")
-        self.lbl_version.grid(row=0, column=3, padx=(0, 12))
+        # ---------- row 0: 主画面 + 控制面板 ----------
+        top_row = ttk.Frame(parent)
+        top_row.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+        top_row.columnconfigure(0, weight=1, minsize=self._scaled(300)[0])
+        top_row.columnconfigure(1, weight=0)   # 控制面板固定宽度, 不拉伸
+        top_row.rowconfigure(0, weight=1)
 
-        ttk.Label(parent, text="激活:").grid(row=0, column=4, padx=(0, 4))
-        self.lbl_activation = ttk.Label(parent, text="未激活", foreground="red")
-        self.lbl_activation.grid(row=0, column=5)
+        # 主画面 (左, 拉伸)
+        view_box = ttk.LabelFrame(top_row, text="融合主画面", padding=4)
+        view_box.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self.fusion_label = tk.Label(view_box, anchor=tk.CENTER, background="black")
+        self.fusion_label.pack(fill=tk.BOTH, expand=True)
 
-    # ----------- 温度数据面板 -----------
-    def _build_temperature_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="实时温度", padding=8)
-        f.grid(row=0, column=0, sticky="we", pady=(0, 6))
+        # 控制面板 (右, 固定较大宽度, 主画面相应变小)
+        ctrl_panel_w = self._scaled(420)[0]
+        ctrl_panel = ttk.Frame(top_row, width=ctrl_panel_w)
+        ctrl_panel.grid(row=0, column=1, sticky="ns")
+        ctrl_panel.grid_propagate(False)
+        self._build_control_panel(ctrl_panel)
 
-        ttk.Label(f, text="最高:").grid(row=0, column=0, sticky="w")
-        # 温度数值字号 = 默认字号 + 6 (干多点, 突出关键读数)
+        # ---------- row 1: 调试 ----------
+        self._build_debug_panel(parent)
+
+        # 解析帧用的隐藏 VisibleView
+        self.visible_view = VisibleView(parent, initial_size=(1, 1))
+
+    def _build_control_panel(self, parent):
+        """右侧控制面板: 温度/曲线/显示/伪彩/融合 5 张卡, 全部自然高度纵向叠加."""
+        parent.columnconfigure(0, weight=1)
+
+        # 1) 温度卡
+        temp_card = ttk.LabelFrame(parent, text="实时温度", padding=6)
+        temp_card.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
+        self._build_temperature_card(temp_card)
+
+        # 2) 温度曲线 (与温度卡等宽)
+        chart_card = ttk.LabelFrame(parent, text="温度曲线", padding=4)
+        chart_card.grid(row=1, column=0, sticky="ew", padx=4, pady=2)
+        self._build_chart_canvas(chart_card)
+
+        # 3) 显示控制
+        self.options_frame = ttk.LabelFrame(parent, text="显示控制", padding=6)
+        self.options_frame.grid(row=2, column=0, sticky="ew", padx=4, pady=2)
+        self._build_display_card(self.options_frame)
+
+        # 4) 颜色映射
+        cmap_card = ttk.LabelFrame(parent, text="颜色映射", padding=6)
+        cmap_card.grid(row=3, column=0, sticky="ew", padx=4, pady=2)
+        self._build_colormap_controls(cmap_card)
+
+        # 5) 可见光融合
+        fuse_card = ttk.LabelFrame(parent, text="可见光融合", padding=6)
+        fuse_card.grid(row=4, column=0, sticky="ew", padx=4, pady=(2, 4))
+        self._build_fusion_controls(fuse_card)
+
+    def _build_temperature_card(self, parent):
+        """三个温度数值水平紧凑排列. 字号与旧上位机一致 (Arial 12 bold)."""
+        items = [("最高", "lbl_tmax", "red"),
+                 ("最低", "lbl_tmin", "blue"),
+                 ("平均", "lbl_tavg", "green")]
+        for i, (label, attr, fg) in enumerate(items):
+            parent.columnconfigure(i, weight=1)
+            cell = ttk.Frame(parent)
+            cell.grid(row=0, column=i, sticky="nsew")
+            ttk.Label(cell, text=label).pack(side=tk.TOP)
+            lbl = ttk.Label(cell, text="--°C",
+                            font=("Arial", 14, "bold"), foreground=fg)
+            lbl.pack(side=tk.TOP)
+            setattr(self, attr, lbl)
+
+    def _build_display_card(self, parent):
+        """滤波加投屏共 4 个开关, 2 行 2 列网格."""
+        self.var_filter = tk.BooleanVar(value=False)
+        self.var_bilateral = tk.BooleanVar(value=HAS_CV2)
+        self.var_thermal_on = tk.BooleanVar(value=True)
+        self.var_visible_on = tk.BooleanVar(value=True)
+        opts = [
+            (0, 0, "卡尔曼滤波", self.var_filter, None, True),
+            (0, 1, "双边滤波", self.var_bilateral, None, HAS_CV2),
+            (1, 0, "热成像投屏", self.var_thermal_on, self._toggle_thermal, True),
+            (1, 1, "可见光投屏", self.var_visible_on, self._toggle_visible, True),
+        ]
+        for r, c, txt, var, cmd, enabled in opts:
+            kwargs = {"text": txt, "variable": var}
+            if cmd is not None:
+                kwargs["command"] = cmd
+            if not enabled:
+                kwargs["state"] = "disabled"
+            ttk.Checkbutton(parent, **kwargs).grid(row=r, column=c, sticky="w", padx=2, pady=2)
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+
+    def _on_tab_changed(self, _evt=None):
+        """切到图片下载 tab → 暂停实时投屏并交出串口; 切回 → 恢复"""
         try:
-            from tkinter import font as tkfont
-            base_size = tkfont.nametofont("TkDefaultFont").cget("size")
+            current = self.notebook.index(self.notebook.select())
+        except tk.TclError:
+            return
+        if current == 1:  # 图片下载 tab
+            # 首次切入时延迟构建 PhotoDownloadTab (避免启动开销)
+            if self.photo_tab is None:
+                try:
+                    from photo_download_tab import PhotoDownloadTab
+                    self.photo_tab = PhotoDownloadTab(self.photo_tab_frame, self)
+                    self.photo_tab.pack(fill=tk.BOTH, expand=True)
+                except Exception as e:
+                    self._log(f"[错误] 加载图片下载 tab 失败: {e}", "error")
+                    import traceback
+                    self._log(traceback.format_exc(), "error")
+                    return
+            # 关闭实时投屏的边缘融合 (与可见光投屏一样, tab 切走自动关)
+            if self._saved_fusion_mode is None:
+                self._saved_fusion_mode = self.fusion_mode_var.get()
+            if self.fusion_mode_var.get() != "off":
+                self.fusion_mode_var.set("off")
+                self._on_fusion_mode_changed()
+            # 暂停实时投屏 (心跳 + reader)
+            self.acquire_serial(reason="图片下载 tab 激活")
+        else:  # 实时投屏 tab
+            self.release_serial(reason="切回实时投屏 tab")
+            # 恢复融合模式
+            if self._saved_fusion_mode is not None:
+                self.fusion_mode_var.set(self._saved_fusion_mode)
+                self._saved_fusion_mode = None
+                self._on_fusion_mode_changed()
+
+    # =================================================================
+    # 串口让出 / 归还 (供图片下载 tab 使用)
+    # =================================================================
+
+    def acquire_serial(self, reason: str = ""):
+        """让出串口给图片下载: 停心跳 + 暂停 reader. 返回 self.serial_port (可能 None)."""
+        if not self.is_connected:
+            return None
+        self._log(f"[串口] 让出 ({reason})", "info") if reason else None
+        # 停心跳
+        self._stop_thermal_streaming()
+        self._stop_visible_streaming()
+        # 暂停 reader (loop 顶部会检查 reader_paused)
+        self.reader_paused = True
+        # 等 reader 进入空转 (read timeout=0.1, 留 0.2s 余量)
+        time.sleep(0.2)
+        # 清掉串口 buffer 里的残余推流字节, 避免污染下载响应
+        try:
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.reset_input_buffer()
+                self.serial_port.reset_output_buffer()
         except Exception:
-            base_size = 14
-        big_size = base_size + 6
-        self.lbl_tmax = ttk.Label(f, text="--°C", font=("Microsoft YaHei UI", big_size, "bold"), foreground="red")
-        self.lbl_tmax.grid(row=0, column=1, padx=(0, 16))
+            pass
+        # 重置 parser, 避免下次 release 时残留 state 错位
+        self.parser.reset()
+        return self.serial_port
 
-        ttk.Label(f, text="最低:").grid(row=0, column=2, sticky="w")
-        self.lbl_tmin = ttk.Label(f, text="--°C", font=("Microsoft YaHei UI", big_size, "bold"), foreground="blue")
-        self.lbl_tmin.grid(row=0, column=3, padx=(0, 16))
-
-        ttk.Label(f, text="平均:").grid(row=0, column=4, sticky="w")
-        self.lbl_tavg = ttk.Label(f, text="--°C", font=("Microsoft YaHei UI", big_size, "bold"), foreground="green")
-        self.lbl_tavg.grid(row=0, column=5)
-
-    # ----------- 热成像画布 -----------
-    def _build_thermal_canvas(self, parent):
-        f = ttk.LabelFrame(parent, text="热成像画面", padding=4)
-        f.grid(row=1, column=0, sticky="we", pady=(0, 6))
-
-        self.thermal_fig = plt.figure(figsize=(4, 3))
-        self.thermal_ax = self.thermal_fig.add_subplot(111)
-        self.thermal_ax.axis("off")
-        self.thermal_im = self.thermal_ax.imshow(self.thermal_data, cmap="coolwarm",
-                                                 interpolation="bilinear", aspect="equal")
-        self.thermal_fig.subplots_adjust(0, 0, 1, 1)
-        self.thermal_canvas = FigureCanvasTkAgg(self.thermal_fig, f)
-        self.thermal_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    def release_serial(self, reason: str = ""):
+        """图片下载完成 → 恢复 reader + 心跳."""
+        if not self.is_connected:
+            return
+        self._log(f"[串口] 归还 ({reason})", "info") if reason else None
+        # 清空串口 buffer 中下载残余 (e.g. 设备保存的图片字节)
+        try:
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.reset_input_buffer()
+        except Exception:
+            pass
+        self.parser.reset()
+        # 恢复 reader
+        self.reader_paused = False
+        # 恢复心跳 (按用户配置)
+        if self.is_activated:
+            if self.var_thermal_on.get():
+                self._start_thermal_streaming()
+            if self.var_visible_on.get():
+                self._start_visible_streaming()
 
     # ----------- 温度曲线 -----------
     def _build_chart_canvas(self, parent):
-        f = ttk.LabelFrame(parent, text="温度变化趋势", padding=4)
-        f.grid(row=2, column=0, sticky="nsew")
-
-        self.chart_fig = plt.figure(figsize=(5, 2.4))
+        self.chart_fig = plt.figure(figsize=(4.2, 1.8), dpi=80)
         self.chart_ax = self.chart_fig.add_subplot(111)
         self.chart_ax.set_xlim(0, self.MAX_HISTORY_POINTS)
         self.chart_ax.set_ylim(0, 50)
         self.chart_ax.grid(True, alpha=0.3)
-        kw = {"fontproperties": _font_prop} if _font_prop else {}
-        self.chart_ax.set_title("温度曲线", **kw)
-        self.line_max, = self.chart_ax.plot([], [], "r-", label="最高", linewidth=1.5)
-        self.line_min, = self.chart_ax.plot([], [], "b-", label="最低", linewidth=1.5)
-        self.line_avg, = self.chart_ax.plot([], [], "g-", label="平均", linewidth=1.5)
-        if _font_prop:
-            self.chart_ax.legend(prop=_font_prop, loc="upper left")
-        else:
-            self.chart_ax.legend(loc="upper left")
-        self.chart_fig.subplots_adjust(left=0.1, right=0.97, top=0.85, bottom=0.18)
-        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, f)
+        self.line_max, = self.chart_ax.plot([], [], "r-", label="Max", linewidth=1.2)
+        self.line_min, = self.chart_ax.plot([], [], "b-", label="Min", linewidth=1.2)
+        self.line_avg, = self.chart_ax.plot([], [], "g-", label="Avg", linewidth=1.2)
+        self.chart_ax.legend(loc="upper left", fontsize=7)
+        self.chart_ax.tick_params(labelsize=7)
+        self.chart_fig.subplots_adjust(left=0.10, right=0.99, top=0.95, bottom=0.18)
+        self.chart_canvas = FigureCanvasTkAgg(self.chart_fig, parent)
         self.chart_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    # ----------- 可见光面板 -----------
-    def _build_visible_panel(self, parent):
-        f = ttk.LabelFrame(parent, text="可见光画面 (默认关闭, 勾选启用)", padding=4)
-        f.grid(row=0, column=0, sticky="nsew", pady=(0, 6))
-        self.visible_view = VisibleView(f, initial_size=(360, 480))
-        self.visible_view.pack(fill=tk.BOTH, expand=True)
+    # ----------- 伪彩 (颜色映射) 控件 -----------
+    def _build_colormap_controls(self, parent):
+        """伪彩控件: 与图片下载 tab 一致. parent 已是 LabelFrame, 不重复标题."""
+        # 行1: 映射曲线 + 调色盘
+        r1 = ttk.Frame(parent)
+        r1.pack(side=tk.TOP, fill=tk.X, pady=2)
+        ttk.Label(r1, text="曲线:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Radiobutton(r1, text="线性", variable=self.mapping_curve, value="linear",
+                        command=self._schedule_fusion_redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(r1, text="S曲线", variable=self.mapping_curve, value="nonlinear",
+                        command=self._schedule_fusion_redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Label(r1, text="调色盘:").pack(side=tk.LEFT, padx=(10, 2))
+        cmaps = ['jet', 'hot', 'cool', 'rainbow', 'viridis', 'plasma',
+                 'inferno', 'magma', 'cividis', 'turbo', 'coolwarm']
+        cb = ttk.Combobox(r1, textvariable=self.colormap_name, values=cmaps,
+                          width=10, state='readonly')
+        cb.pack(side=tk.LEFT, padx=2)
+        cb.bind('<<ComboboxSelected>>', lambda _e: self._schedule_fusion_redraw())
+
+        # 行2: 自定义三色
+        r2 = ttk.Frame(parent)
+        r2.pack(side=tk.TOP, fill=tk.X, pady=2)
+        ttk.Checkbutton(r2, text="使用自定义颜色", variable=self.use_custom_colors,
+                        command=self._schedule_fusion_redraw).pack(side=tk.LEFT)
+        ttk.Label(r2, text="冷:").pack(side=tk.LEFT, padx=(10, 2))
+        self.cold_color_btn = tk.Button(r2, text="  ", bg=self.cold_color,
+                                        width=3, command=lambda: self._pick_cmap_color('cold'))
+        self.cold_color_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(r2, text="中:").pack(side=tk.LEFT, padx=(6, 2))
+        self.mid_color_btn = tk.Button(r2, text="  ", bg=self.mid_color,
+                                       width=3, command=lambda: self._pick_cmap_color('mid'))
+        self.mid_color_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Label(r2, text="热:").pack(side=tk.LEFT, padx=(6, 2))
+        self.hot_color_btn = tk.Button(r2, text="  ", bg=self.hot_color,
+                                       width=3, command=lambda: self._pick_cmap_color('hot'))
+        self.hot_color_btn.pack(side=tk.LEFT, padx=2)
+
+    def _pick_cmap_color(self, which: str):
+        from tkinter import colorchooser
+        cur = {"cold": self.cold_color, "mid": self.mid_color, "hot": self.hot_color}[which]
+        title = {"cold": "选择最低温颜色", "mid": "选择中间温颜色", "hot": "选择最高温颜色"}[which]
+        c = colorchooser.askcolor(color=cur, title=title)
+        if c and c[1]:
+            if which == "cold":
+                self.cold_color = c[1]; self.cold_color_btn.config(bg=c[1])
+            elif which == "mid":
+                self.mid_color = c[1]; self.mid_color_btn.config(bg=c[1])
+            else:
+                self.hot_color = c[1]; self.hot_color_btn.config(bg=c[1])
+            self._schedule_fusion_redraw()
+
+    def _build_fusion_controls(self, parent):
+        """融合参数控件: 模式 + gamma + alpha + edge 系列. parent 已是 LabelFrame."""
+        ctrl = ttk.Frame(parent)
+        ctrl.pack(side=tk.TOP, fill=tk.X)
+
+        # 行1: 模式
+        r1 = ttk.Frame(ctrl)
+        r1.pack(side=tk.TOP, fill=tk.X, pady=2)
+        ttk.Label(r1, text="模式:").pack(side=tk.LEFT, padx=(0, 4))
+        for txt, val in (("纯热像", "off"), ("混合", "blend"), ("边缘", "edge")):
+            ttk.Radiobutton(r1, text=txt, variable=self.fusion_mode_var, value=val,
+                            command=self._on_fusion_mode_changed).pack(side=tk.LEFT, padx=2)
+
+        # 行2: blend
+        self.fr_blend = ttk.Frame(ctrl)
+        ttk.Label(self.fr_blend, text="可见光比例:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Scale(self.fr_blend, from_=0.0, to=1.0, variable=self.fusion_alpha,
+                  orient=tk.HORIZONTAL, length=120,
+                  command=lambda _e: self._schedule_fusion_redraw()).pack(side=tk.LEFT, padx=2)
+        ttk.Label(self.fr_blend, text="伽马:").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Scale(self.fr_blend, from_=0.3, to=3.0, variable=self.fusion_gamma,
+                  orient=tk.HORIZONTAL, length=100,
+                  command=lambda _e: self._schedule_fusion_redraw()).pack(side=tk.LEFT, padx=2)
+
+        # 行3: edge
+        self.fr_edge = ttk.Frame(ctrl)
+        ttk.Label(self.fr_edge, text="强度:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Scale(self.fr_edge, from_=0.0, to=1.0, variable=self.fusion_edge_strength,
+                  orient=tk.HORIZONTAL, length=80,
+                  command=lambda _e: self._schedule_fusion_redraw()).pack(side=tk.LEFT, padx=2)
+        ttk.Label(self.fr_edge, text="阈值:").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Scale(self.fr_edge, from_=0.0, to=1.0, variable=self.fusion_edge_thresh,
+                  orient=tk.HORIZONTAL, length=80,
+                  command=lambda _e: self._schedule_fusion_redraw()).pack(side=tk.LEFT, padx=2)
+        ttk.Label(self.fr_edge, text="粗细:").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Spinbox(self.fr_edge, from_=0, to=6, width=3, textvariable=self.fusion_edge_width,
+                    command=self._schedule_fusion_redraw).pack(side=tk.LEFT, padx=2)
+        self.edge_color_btn = tk.Button(self.fr_edge, text="边缘色", bg=self.edge_color, fg="white",
+                                        command=self._pick_edge_color, width=6)
+        self.edge_color_btn.pack(side=tk.LEFT, padx=(6, 2))
+
+        # edge 模式可见光伽马
+        self.fr_edge_gamma = ttk.Frame(ctrl)
+        ttk.Label(self.fr_edge_gamma, text="可见光伽马:").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Scale(self.fr_edge_gamma, from_=0.3, to=3.0, variable=self.fusion_gamma,
+                  orient=tk.HORIZONTAL, length=120,
+                  command=lambda _e: self._schedule_fusion_redraw()).pack(side=tk.LEFT, padx=2)
+
+        self._on_fusion_mode_changed()
+
+    def _on_fusion_mode_changed(self):
+        m = self.fusion_mode_var.get()
+        for fr in (getattr(self, "fr_blend", None),
+                   getattr(self, "fr_edge", None),
+                   getattr(self, "fr_edge_gamma", None)):
+            if fr is not None:
+                fr.pack_forget()
+        if m == "blend" and hasattr(self, "fr_blend"):
+            self.fr_blend.pack(side=tk.TOP, fill=tk.X, pady=2)
+        elif m == "edge" and hasattr(self, "fr_edge"):
+            self.fr_edge.pack(side=tk.TOP, fill=tk.X, pady=2)
+            self.fr_edge_gamma.pack(side=tk.TOP, fill=tk.X, pady=2)
+        self._schedule_fusion_redraw()
+
+    def _pick_edge_color(self):
+        from tkinter import colorchooser
+        c = colorchooser.askcolor(color=self.edge_color, title="选择边缘颜色")
+        if c and c[1]:
+            self.edge_color = c[1]
+            self.edge_color_btn.config(bg=c[1])
+            self._schedule_fusion_redraw()
+
+    # ----------- 设备信息条 -----------
+    def _build_device_info(self, parent):
+        ttk.Label(parent, text="序列号:").pack(side=tk.LEFT, padx=(0, 2))
+        self.lbl_serial = ttk.Label(parent, text="--", foreground="gray")
+        self.lbl_serial.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(parent, text="版本:").pack(side=tk.LEFT, padx=(0, 2))
+        self.lbl_version = ttk.Label(parent, text="--", foreground="gray")
+        self.lbl_version.pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Label(parent, text="激活:").pack(side=tk.LEFT, padx=(0, 2))
+        self.lbl_activation = ttk.Label(parent, text="未激活", foreground="red")
+        self.lbl_activation.pack(side=tk.LEFT)
 
     # ----------- 调试面板 -----------
     def _build_debug_panel(self, parent):
         f = ttk.LabelFrame(parent, text="串口调试", padding=4)
-        f.grid(row=1, column=0, sticky="nsew")
+        f.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
 
         out_frame = ttk.Frame(f)
         out_frame.pack(fill=tk.BOTH, expand=True)
-        try:
-            from tkinter import font as tkfont
-            _dbg_size = tkfont.nametofont("TkDefaultFont").cget("size")
-        except Exception:
-            _dbg_size = 14
-        self.debug_text = tk.Text(out_frame, height=8, wrap=tk.WORD,
-                                  font=("Consolas", _dbg_size - 2), bg="black", fg="lime")
+        self.debug_text = tk.Text(out_frame, height=4, wrap=tk.WORD,
+                                  font=("Consolas", 9), bg="black", fg="lime")
         sb = ttk.Scrollbar(out_frame, command=self.debug_text.yview)
         self.debug_text.configure(yscrollcommand=sb.set)
         self.debug_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -563,9 +815,15 @@ class ThermalDualApp:
     # =================================================================
 
     def _reader_loop(self):
-        """单一接收线程, 把所有字节喂给 FrameParser. 任何异常 → 触发断开."""
+        """单一接收线程, 把所有字节喂给 FrameParser. 任何异常 → 触发断开.
+        当 reader_paused=True 时不读取串口, 让出给图片下载 tab.
+        """
         sp = self.serial_port
         while not self.stop_event.is_set() and sp and sp.is_open:
+            if self.reader_paused:
+                # 让出串口给图片下载 tab. 不读, 短暂 sleep
+                time.sleep(0.05)
+                continue
             try:
                 data = sp.read(4096)
                 if data:
@@ -614,6 +872,12 @@ class ThermalDualApp:
                 elif kind == "visible":
                     w, h, frame = payload
                     self.visible_view.update_frame(w, h, frame)
+                    # 缓存最新可见光 PIL (含旋转/镜像), 供融合主画面使用
+                    try:
+                        self._latest_visible_pil = self.visible_view.get_latest_image_pil()
+                    except Exception:
+                        self._latest_visible_pil = None
+                    self._schedule_fusion_redraw()
                 elif kind == "log":
                     self._log(*payload)
                 elif kind == "activation_response":
@@ -624,9 +888,8 @@ class ThermalDualApp:
             self._after_id_queue = self.root.after(80, self._process_queue)
 
     def _reset_ui_after_disconnect(self):
-        self.dev_info_frame.grid_remove()
-        self.options_frame.grid_remove()
-        self.main_frame.grid_remove()
+        self.dev_info_frame.pack_forget()
+        self.notebook.grid_remove()
         self.lbl_serial.config(text="--", foreground="gray")
         self.lbl_version.config(text="--", foreground="gray")
         self.lbl_activation.config(text="未激活", foreground="red")
@@ -638,9 +901,13 @@ class ThermalDualApp:
         self.history_min.clear()
         self.history_avg.clear()
         self.visible_view.clear()
-        w = int(640 * getattr(self, "_win_ratio", 1.0))
-        h = int(360 * getattr(self, "_win_ratio", 1.0))
-        self.root.geometry(f"{w}x{h}")
+        self._latest_visible_pil = None
+        self._latest_thermal_arr = None
+        if hasattr(self, "fusion_label"):
+            self.fusion_label.configure(image="")
+            self._fusion_photo = None
+        self.root.geometry(self._scaled_geom(520, 110))
+        self.root.minsize(*self._scaled(420, 90))
 
     def _handle_device_info(self, info: dict):
         """收到设备信息: 更新设备条 + 决定激活流程."""
@@ -651,24 +918,23 @@ class ThermalDualApp:
             text="已激活" if self.is_activated else "未激活",
             foreground="green" if self.is_activated else "red",
         )
-        self.dev_info_frame.grid()
+        if not self.dev_info_frame.winfo_ismapped():
+            self.dev_info_frame.pack(side=tk.RIGHT)
 
         if self.is_activated:
             # 销毁激活面板, 显示主内容
             if self.activation_frame:
                 self.activation_frame.destroy()
                 self.activation_frame = None
-            self.options_frame.grid()
-            self.main_frame.grid()
-            # 与老程一致的已激活尺寸 (可见光面板需多些横向空间 → 1300→ 1500)
-            r = getattr(self, "_win_ratio", 1.0)
-            # 屏幕可能装不下太大的主窗, 用屏幕分辨率裁顶
+            self.notebook.grid()
+            # 与图片下载工具同源, 多了右侧控制面板, 扩宽一点. 按 DPI 比例放大.
             sw = self.root.winfo_screenwidth()
             sh = self.root.winfo_screenheight()
-            tw = min(int(1600 * r), sw - 80)
-            th = min(int(900 * r), sh - 80)
+            tw_target, th_target = self._scaled(1280, 820)
+            tw = min(tw_target, sw - 80)
+            th = min(th_target, sh - 80)
             self.root.geometry(f"{tw}x{th}")
-            self.root.minsize(min(int(1500 * r), tw), min(int(820 * r), th))
+            self.root.minsize(*self._scaled(1100, 700))
             self._start_thermal_streaming()
             # 默认开启可见光投屏 (var_visible_on=True)
             if self.var_visible_on.get():
@@ -782,6 +1048,8 @@ class ThermalDualApp:
         else:
             self._stop_visible_streaming()
             self.visible_view.clear()
+            self._latest_visible_pil = None
+            self._schedule_fusion_redraw()
             self._log("[可见光] 已停止推流", "info")
 
     # ---------- 热帧 UI 更新 (主线程) ----------
@@ -808,11 +1076,12 @@ class ThermalDualApp:
 
         # 与老程一致的显示朝向: 旋转 180 + 水平翻转
         display = np.fliplr(np.rot90(arr, 2))
-
-        self.thermal_im.set_array(display)
+        self._latest_thermal_arr = display
         vmin, vmax = float(np.min(display)), float(np.max(display))
-        self.thermal_im.set_clim(vmin=vmin, vmax=vmax)
-        self.thermal_canvas.draw_idle()
+        self._latest_clim = (vmin, vmax)
+
+        # 重绘融合主画面 (走节流, 30ms 内合并)
+        self._schedule_fusion_redraw()
 
         # 温度数值
         self.lbl_tmax.config(text=f"{tmax_s:.1f}°C")
@@ -827,14 +1096,82 @@ class ThermalDualApp:
             self.history_max.pop(0)
             self.history_min.pop(0)
             self.history_avg.pop(0)
-        x = list(range(len(self.history_max)))
-        self.line_max.set_data(x, self.history_max)
-        self.line_min.set_data(x, self.history_min)
-        self.line_avg.set_data(x, self.history_avg)
-        self.chart_ax.set_xlim(0, max(self.MAX_HISTORY_POINTS, len(x)))
-        all_t = self.history_max + self.history_min + self.history_avg
-        self.chart_ax.set_ylim(min(all_t) - 3, max(all_t) + 3)
-        self.chart_canvas.draw_idle()
+        # 曲线 5 帧重绘一次, 避免 matplotlib 每帧 draw 占满 UI 线程
+        self._chart_frame_counter = getattr(self, "_chart_frame_counter", 0) + 1
+        if self._chart_frame_counter % 5 == 0:
+            x = list(range(len(self.history_max)))
+            self.line_max.set_data(x, self.history_max)
+            self.line_min.set_data(x, self.history_min)
+            self.line_avg.set_data(x, self.history_avg)
+            self.chart_ax.set_xlim(0, max(self.MAX_HISTORY_POINTS, len(x)))
+            all_t = self.history_max + self.history_min + self.history_avg
+            self.chart_ax.set_ylim(min(all_t) - 3, max(all_t) + 3)
+            self.chart_canvas.draw_idle()
+
+    # ---------- 融合主画面渲染 ----------
+    def _schedule_fusion_redraw(self):
+        """节流: 30ms 内合并多次重绘请求."""
+        if self._fusion_redraw_pending:
+            return
+        self._fusion_redraw_pending = True
+        try:
+            self.root.after(30, self._redraw_fusion)
+        except Exception:
+            self._fusion_redraw_pending = False
+
+    def _redraw_fusion(self):
+        """用 colormap 把热像染色, 上采样, 叠加可见光融合后显示."""
+        self._fusion_redraw_pending = False
+        if self._latest_thermal_arr is None or self._latest_clim is None:
+            return
+        if not hasattr(self, "fusion_label"):
+            return
+        try:
+            display = self._latest_thermal_arr
+            vmin, vmax = self._latest_clim
+            denom = max(vmax - vmin, 1e-6)
+            norm = np.clip((display - vmin) / denom, 0.0, 1.0)
+            # 用 colorize 染色 (含线性/非线性 + 自定义颜色)
+            therm_rgb = fusion_utils.colorize(
+                norm,
+                colormap_name=self.colormap_name.get(),
+                mapping_curve=self.mapping_curve.get(),
+                use_custom_colors=self.use_custom_colors.get(),
+                cold_color=self.cold_color,
+                mid_color=self.mid_color,
+                hot_color=self.hot_color,
+            )
+            therm_pil = Image.fromarray(therm_rgb, mode="RGB")
+
+            # 计算目标显示尺寸: 跟 fusion_label 实际大小, 保持热像宽高比
+            w_now = self.fusion_label.winfo_width()
+            h_now = self.fusion_label.winfo_height()
+            if w_now <= 1 or h_now <= 1:
+                w_now, h_now = 360, 270
+            th, tw = display.shape
+            scale = min((w_now - 4) / tw, (h_now - 4) / th)
+            if scale > 1:
+                new_size = (max(int(tw * scale), 1), max(int(th * scale), 1))
+                therm_pil = therm_pil.resize(new_size, Image.Resampling.BILINEAR)
+
+            # 融合
+            mode = self.fusion_mode_var.get()
+            vis_pil = self._latest_visible_pil if self.var_visible_on.get() else None
+            fused = fusion_utils.fuse(
+                therm_pil, vis_pil,
+                mode=mode,
+                gamma=float(self.fusion_gamma.get()),
+                alpha=float(self.fusion_alpha.get()),
+                edge_strength=float(self.fusion_edge_strength.get()),
+                edge_thresh=float(self.fusion_edge_thresh.get()),
+                edge_width=int(self.fusion_edge_width.get()),
+                edge_color=self.edge_color,
+            )
+
+            self._fusion_photo = ImageTk.PhotoImage(fused)
+            self.fusion_label.configure(image=self._fusion_photo)
+        except Exception as e:
+            self._log(f"[错误] 融合渲染失败: {e}", "error")
 
     @staticmethod
     def _apply_bilateral(arr: np.ndarray) -> np.ndarray:
@@ -892,13 +1229,13 @@ class ThermalDualApp:
 
 
 def main():
-    # Windows: 关闭系统 DPI 自动缩放, 让 tk scaling 真正生效
-    # (默认 DPI-unaware, Windows 会按 96dpi 渲染再做位图缩放, 字体糊;
-    #  DPI-aware 后 Tk 内部按真实 DPI 计算 scaling, 我们再覆写它)
+    # 强制 125% 缩放: 启用 DPI 感知 + 固定 scaling = 1.25
+    # 窗口尺寸也会乘以 _win_ratio, 保证内容装得下
+    DPI_SCALE = 1.50
     if os.name == "nt":
         try:
             import ctypes
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             try:
                 ctypes.windll.user32.SetProcessDPIAware()
@@ -906,17 +1243,11 @@ def main():
                 pass
 
     root = tk.Tk()
-    # tk scaling 默认值 = 系统 DPI / 72. 1080p 96dpi → 1.333; 4K 192dpi → 2.667.
-    # 我们直接覆写, 取一个明显比默认大的值. 环境变量 THERMAL_DUAL_SCALE 可覆写.
     try:
-        scale_env = os.environ.get("THERMAL_DUAL_SCALE")
-        scale_val = float(scale_env) if scale_env else 2.0
-        root.tk.call("tk", "scaling", scale_val)
-        print(f"[scaling] tk scaling set to {scale_val}, "
-              f"actual = {root.tk.call('tk', 'scaling')}")
-    except Exception as e:
-        print(f"[scaling] failed: {e}")
-    app = ThermalDualApp(root)
+        root.tk.call("tk", "scaling", DPI_SCALE * 96.0 / 72.0)
+    except Exception:
+        pass
+    app = ThermalDualApp(root, win_ratio=DPI_SCALE)
 
     def on_closing():
         app.shutdown()
